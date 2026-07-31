@@ -1,51 +1,48 @@
-import { world, system, BlockPermutation } from "@minecraft/server";
+import { world, system } from "@minecraft/server";
 
-const CFG = {
+const CONFIG = {
   dimension: "overworld",
   centerX: 0,
   centerZ: 0,
-  radius: 48,
-  topY: 96,
-  bottomY: -48,
-  depth: 42,
-  sourceRadius: 80,
-  maxSurfaceCaptureHeight: 80,
-  batchSize: 250,
-  seaLevel: 63,
-  // Increase this to make the island hang farther downward.
-  undersideExponent: 1.65,
+  sourceRadius: 96,
+  islandRadius: 64,
+  targetSurfaceY: 72,
+  minY: -64,
+  maxY: 320,
+  maxDepth: 64,
+  batchSize: 512,
+  chunkSize: 16,
+  noiseScale: 0.045,
+  roughness: 0.16,
+  seedProperty: "islandaddon_seed",
+  completeProperty: "islandaddon_complete",
 };
 
+const AIR = new Set(["minecraft:air", "minecraft:cave_air", "minecraft:void_air"]);
+const WATER = new Set(["minecraft:water", "minecraft:flowing_water"]);
 const SURFACE = new Set([
   "minecraft:grass_block", "minecraft:dirt", "minecraft:coarse_dirt", "minecraft:podzol",
   "minecraft:mycelium", "minecraft:grass_path", "minecraft:mud", "minecraft:clay",
   "minecraft:sand", "minecraft:red_sand", "minecraft:gravel", "minecraft:snow",
-  "minecraft:snow_layer", "minecraft:stone", "minecraft:deepslate", "minecraft:rooted_dirt",
-  "minecraft:farmland", "minecraft:moss_block", "minecraft:ice", "minecraft:packed_ice",
-  "minecraft:blue_ice", "minecraft:water", "minecraft:flowing_water", "minecraft:lava",
-  "minecraft:flowing_lava"
+  "minecraft:snow_layer", "minecraft:moss_block", "minecraft:ice", "minecraft:packed_ice",
+  "minecraft:blue_ice", "minecraft:rooted_dirt", "minecraft:farmland", "minecraft:stone",
+  "minecraft:deepslate", "minecraft:water", "minecraft:flowing_water"
+]);
+const STRUCTURE = /(^|:)(oak|spruce|birch|jungle|acacia|dark_oak|mangrove|cherry|bamboo|crimson|warped)_(log|wood|planks|stem|hyphae|stripped_log|stripped_wood|stripped_stem|stripped_hyphae)$/;
+const DEEP = new Set([
+  "minecraft:stone", "minecraft:deepslate", "minecraft:tuff", "minecraft:granite",
+  "minecraft:diorite", "minecraft:andesite", "minecraft:calcite", "minecraft:dripstone_block"
 ]);
 
-const NON_SURFACE_SOLIDS = new Set([
-  "minecraft:oak_log", "minecraft:spruce_log", "minecraft:birch_log", "minecraft:jungle_log",
-  "minecraft:acacia_log", "minecraft:dark_oak_log", "minecraft:mangrove_log", "minecraft:cherry_log",
-  "minecraft:oak_planks", "minecraft:spruce_planks", "minecraft:birch_planks", "minecraft:jungle_planks",
-  "minecraft:acacia_planks", "minecraft:dark_oak_planks", "minecraft:mangrove_planks", "minecraft:cherry_planks"
-]);
+let running = false;
 
-let started = false;
-
-function hashSeed(seed) {
-  let h = 2166136261 >>> 0;
-  const s = String(seed);
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return h >>> 0;
+function hash(x, z, seed) {
+  let h = (seed ^ Math.imul(x, 374761393) ^ Math.imul(z, 668265263)) >>> 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177) >>> 0;
+  return (h ^ (h >>> 16)) >>> 0;
 }
 
-function rng(seed) {
+function rand(seed) {
   let x = seed >>> 0;
   return () => {
     x ^= x << 13; x >>>= 0;
@@ -55,190 +52,180 @@ function rng(seed) {
   };
 }
 
-function isSurfaceId(id) {
+function noise(x, z, seed) {
+  const ix = Math.floor(x), iz = Math.floor(z);
+  const fx = x - ix, fz = z - iz;
+  const s = t => t * t * (3 - 2 * t);
+  const v = (a, b) => hash(a, b, seed) / 4294967296 * 2 - 1;
+  const a = v(ix, iz), b = v(ix + 1, iz), c = v(ix, iz + 1), d = v(ix + 1, iz + 1);
+  const sx = s(fx), sz = s(fz);
+  return (a + (b - a) * sx) * (1 - sz) + (c + (d - c) * sx) * sz;
+}
+
+function islandMask(x, z, seed) {
+  const nx = x / CONFIG.islandRadius;
+  const nz = z / CONFIG.islandRadius;
+  const vertical = (nz + 1) * 0.5;
+  // Broad/flat upper half, narrowing naturally toward a slightly spiky bottom.
+  const taper = nz <= -0.15 ? 1 : Math.max(0.08, 1 - (nz + 0.15) * 0.82);
+  const n = noise(x * CONFIG.noiseScale, z * CONFIG.noiseScale, seed);
+  const n2 = noise(x * CONFIG.noiseScale * 2.7, z * CONFIG.noiseScale * 2.7, seed ^ 0x51ed270b);
+  const radius = 1 + n * CONFIG.roughness + n2 * 0.07;
+  const boundary = Math.max(0.04, taper * radius);
+  const side = Math.abs(nx) / boundary;
+  if (side >= 1 || vertical < 0 || vertical > 1.08) return 0;
+  const topShape = nz < 0 ? 1 : 1 - Math.pow(Math.max(0, nz), 2.2) * 0.22;
+  const edge = 1 - side;
+  const end = nz > 0.72 ? Math.max(0, 1 - (nz - 0.72) / 0.28) : 1;
+  return Math.max(0, edge * topShape * end);
+}
+
+function isAir(id) { return AIR.has(id); }
+function isWater(id) { return WATER.has(id); }
+function isStructure(id) { return STRUCTURE.test(id); }
+function isSurface(id) {
+  if (isAir(id) || isStructure(id)) return false;
   if (SURFACE.has(id)) return true;
-  if (NON_SURFACE_SOLIDS.has(id)) return false;
-  return id.endsWith("_leaves") || id.endsWith("_leaves2") || id.endsWith("_sapling") ||
-    id.includes("flower") || id.includes("mushroom") || id.includes("grass") || id.includes("fern") ||
-    id.includes("crop") || id.includes("vine") || id.includes("bush") || id.includes("tallgrass");
+  return id.includes("leaves") || id.includes("sapling") || id.includes("flower") ||
+    id.includes("grass") || id.includes("fern") || id.includes("mushroom") ||
+    id.includes("vine") || id.includes("bush") || id.includes("crop");
 }
+function isDeep(id) { return DEEP.has(id); }
 
-function isAir(id) {
-  return id === "minecraft:air" || id === "minecraft:cave_air" || id === "minecraft:void_air";
-}
-
-function isWater(id) {
-  return id === "minecraft:water" || id === "minecraft:flowing_water";
-}
-
-function isUsefulBlock(block) {
-  return block && !isAir(block.typeId);
-}
-
-function teardropMask(x, z, r) {
-  const nx = x / r;
-  const nz = z / r;
-  const d = Math.sqrt(nx * nx + nz * nz);
-  if (d > 1) return 0;
-  // Rounded top with a pointed lower tip: upside-down teardrop.
-  const vertical = 1 - 0.48 * Math.max(0, nz);
-  const width = Math.max(0.08, vertical);
-  const edge = Math.sqrt(Math.max(0, 1 - (nz * 0.92) ** 2));
-  const local = Math.abs(nx) / Math.max(0.05, edge * width);
-  return Math.max(0, 1 - local) * Math.max(0, 1 - d * 0.08);
-}
-
-function getSurfaceAndAbove(dimension, x, z) {
-  const top = dimension.getTopmostBlock({ x, z }, CFG.bottomY);
+function findSurface(dimension, x, z) {
+  const top = dimension.getTopmostBlock({ x, z }, CONFIG.minY);
   if (!top) return null;
-  let y = top.location.y;
-  let surfaceY = y;
-  let found = false;
-
-  for (let yy = y; yy >= CFG.bottomY; yy--) {
-    const b = dimension.getBlock({ x, y: yy, z });
-    if (!b) continue;
-    const id = b.typeId;
-    if (isAir(id)) continue;
-    if (isWater(id)) {
-      if (!found) surfaceY = yy;
-      found = true;
-      continue;
-    }
-    if (isSurfaceId(id) || NON_SURFACE_SOLIDS.has(id)) {
-      surfaceY = yy;
-      found = true;
-      break;
-    }
-  }
-  return { topY: y, surfaceY };
-}
-
-function captureColumn(dimension, x, z, rngFn) {
-  const info = getSurfaceAndAbove(dimension, x, z);
-  if (!info) return { blocks: [], surfaceY: CFG.seaLevel };
-  const blocks = [];
-  const start = Math.min(info.topY, CFG.topY + CFG.maxSurfaceCaptureHeight);
-  for (let y = start; y >= info.surfaceY; y--) {
+  let surfaceY = top.location.y;
+  for (let y = top.location.y; y >= CONFIG.minY; y--) {
     const b = dimension.getBlock({ x, y, z });
-    if (!isUsefulBlock(b)) continue;
-    blocks.push({
-      dy: y - info.surfaceY,
-      permutation: b.permutation,
-      id: b.typeId,
-      water: isWater(b.typeId),
-      // Small deterministic jitter lets nearby source columns vary naturally.
-      jitter: rngFn() < 0.08
-    });
+    if (!b || isAir(b.typeId)) continue;
+    if (isWater(b.typeId)) { surfaceY = y; continue; }
+    if (isSurface(b.typeId)) { surfaceY = y; break; }
+    if (!isStructure(b.typeId)) { surfaceY = y; break; }
   }
-  return { blocks, surfaceY: info.surfaceY };
+  return { surfaceY, topY: top.location.y };
 }
 
-function buildDeepPalette(dimension, seed, rngFn) {
-  const palette = [];
-  for (let x = -CFG.sourceRadius; x <= CFG.sourceRadius; x += 8) {
-    for (let z = -CFG.sourceRadius; z <= CFG.sourceRadius; z += 8) {
-      const wx = CFG.centerX + x;
-      const wz = CFG.centerZ + z;
-      const info = getSurfaceAndAbove(dimension, wx, wz);
-      if (!info) continue;
-      const base = Math.max(CFG.bottomY, info.surfaceY - 18);
-      for (let y = base; y >= Math.max(CFG.bottomY, base - 55); y--) {
-        const b = dimension.getBlock({ x: wx, y, z: wz });
-        if (!b || isAir(b.typeId) || isWater(b.typeId)) continue;
-        if (b.typeId === "minecraft:stone" || b.typeId === "minecraft:deepslate" ||
-            b.typeId === "minecraft:tuff" || b.typeId === "minecraft:granite" ||
-            b.typeId === "minecraft:diorite" || b.typeId === "minecraft:andesite") {
-          palette.push(b.permutation);
-        }
-      }
-    }
+function captureColumn(dimension, x, z) {
+  const info = findSurface(dimension, x, z);
+  if (!info) return null;
+  const blocks = [];
+  for (let y = CONFIG.minY; y <= info.topY; y++) {
+    const b = dimension.getBlock({ x, y, z });
+    if (!b || isAir(b.typeId)) continue;
+    blocks.push({ y, dy: y - info.surfaceY, p: b.permutation, id: b.typeId, deep: isDeep(b.typeId) });
   }
-  return palette;
+  return { surfaceY: info.surfaceY, topY: info.topY, blocks };
 }
 
-function chooseDeep(palette, rngFn) {
-  if (!palette.length) return BlockPermutation.resolve("minecraft:stone");
-  return palette[Math.floor(rngFn() * palette.length)];
-}
-
-async function generateIsland() {
-  const dimension = world.getDimension(CFG.dimension);
-  const seed = hashSeed(world.getAbsoluteTime() ^ world.getDay() ^ String(world.getDynamicProperty("islandaddon_seed") ?? world.getDefaultSpawnLocation().x));
-  const random = rng(seed);
-
-  // Save a stable per-world seed. The actual world seed is not exposed consistently
-  // by all Script API versions, so we derive a deterministic seed once and persist it.
-  if (world.getDynamicProperty("islandaddon_seed") === undefined) {
-    world.setDynamicProperty("islandaddon_seed", seed);
-  }
-
+async function captureSource(dimension) {
   const source = new Map();
-  for (let x = -CFG.sourceRadius; x <= CFG.sourceRadius; x++) {
-    for (let z = -CFG.sourceRadius; z <= CFG.sourceRadius; z++) {
-      const wx = CFG.centerX + x;
-      const wz = CFG.centerZ + z;
-      source.set(`${wx},${wz}`, captureColumn(dimension, wx, wz, random));
+  const total = (CONFIG.sourceRadius * 2 + 1) ** 2;
+  let count = 0;
+  for (let x = -CONFIG.sourceRadius; x <= CONFIG.sourceRadius; x++) {
+    for (let z = -CONFIG.sourceRadius; z <= CONFIG.sourceRadius; z++) {
+      const col = captureColumn(dimension, CONFIG.centerX + x, CONFIG.centerZ + z);
+      if (col) source.set(`${x},${z}`, col);
+      count++;
+      if (count % 128 === 0) await system.waitTicks(1);
     }
-    await system.waitTicks(1);
   }
-
-  const deepPalette = buildDeepPalette(dimension, seed, random);
-  const operations = [];
-
-  for (let x = -CFG.radius; x <= CFG.radius; x++) {
-    for (let z = -CFG.radius; z <= CFG.radius; z++) {
-      const mask = teardropMask(x, z, CFG.radius);
-      if (mask <= 0) continue;
-
-      const src = source.get(`${CFG.centerX + x},${CFG.centerZ + z}`);
-      if (!src) continue;
-      const targetSurface = CFG.seaLevel + Math.floor(mask * 5);
-      const surfaceBlocks = src.blocks;
-
-      // Pull the captured surface/structure column into the island. Nothing is
-      // synthesized for this layer: every block comes from an existing source column.
-      for (const block of surfaceBlocks) {
-        const ty = targetSurface + block.dy;
-        if (ty < CFG.bottomY || ty > CFG.topY + CFG.maxSurfaceCaptureHeight) continue;
-        operations.push({ x: CFG.centerX + x, y: ty, z: CFG.centerZ + z, p: block.permutation });
-      }
-
-      // The underside is a tapered, upside-down teardrop. Its deep material is
-      // sampled from the stone/deepslate transition palette, with seeded variation.
-      const thickness = Math.max(1, Math.floor(CFG.depth * Math.pow(mask, CFG.undersideExponent)));
-      for (let d = 1; d <= thickness; d++) {
-        const y = targetSurface - d;
-        if (y < CFG.bottomY) break;
-        const transition = d / thickness;
-        const p = chooseDeep(deepPalette, random);
-        // Keep a little natural variation without creating additional volume.
-        if (transition > 0.72 && random() < 0.18) continue;
-        operations.push({ x: CFG.centerX + x, y, z: CFG.centerZ + z, p });
-      }
-    }
-    await system.waitTicks(1);
-  }
-
-  // Write in batches to avoid a single huge tick and let chunks load progressively.
-  for (let i = 0; i < operations.length; i += CFG.batchSize) {
-    const batch = operations.slice(i, i + CFG.batchSize);
-    for (const op of batch) {
-      try {
-        dimension.setBlockPermutation({ x: op.x, y: op.y, z: op.z }, op.p);
-      } catch (_) {}
-    }
-    await system.waitTicks(1);
-  }
-
-  world.setDynamicProperty("islandaddon_complete", true);
+  return source;
 }
 
-world.afterEvents.playerSpawn.subscribe((event) => {
-  if (!event.initialSpawn || started) return;
-  if (world.getDynamicProperty("islandaddon_complete")) return;
-  started = true;
-  system.runTimeout(() => {
-    generateIsland().catch((e) => console.warn(`[IslandAddon] Generation failed: ${e}`));
-  }, 20);
+function getSource(source, x, z) { return source.get(`${x},${z}`); }
+
+function setAir(dimension, x, y, z) {
+  try { dimension.setBlockType({ x, y, z }, "minecraft:air"); } catch (_) {}
+}
+
+function setPermutation(dimension, x, y, z, p) {
+  try { dimension.setBlockPermutation({ x, y, z }, p); } catch (_) {}
+}
+
+async function clearOutside(dimension, source, seed) {
+  let ops = 0;
+  for (let x = -CONFIG.sourceRadius; x <= CONFIG.sourceRadius; x++) {
+    for (let z = -CONFIG.sourceRadius; z <= CONFIG.sourceRadius; z++) {
+      if (islandMask(x, z, seed) > 0) continue;
+      const col = getSource(source, x, z);
+      if (!col) continue;
+      const top = Math.min(CONFIG.maxY, col.topY + 1);
+      for (let y = CONFIG.minY; y <= top; y++) {
+        setAir(dimension, CONFIG.centerX + x, y, CONFIG.centerZ + z);
+        if (++ops >= CONFIG.batchSize) { ops = 0; await system.waitTicks(1); }
+      }
+    }
+  }
+}
+
+async function buildIsland(dimension, source, seed) {
+  const operations = [];
+  for (let x = -CONFIG.islandRadius; x <= CONFIG.islandRadius; x++) {
+    for (let z = -CONFIG.islandRadius; z <= CONFIG.islandRadius; z++) {
+      const mask = islandMask(x, z, seed);
+      if (mask <= 0) continue;
+      const col = getSource(source, x, z);
+      if (!col) continue;
+      const surfaceY = CONFIG.targetSurfaceY + Math.round((col.surfaceY - 63) * 0.2);
+
+      // Preserve the source surface and everything above it. This is where trees,
+      // houses, villages and other structures are carried onto the island.
+      for (const b of col.blocks) {
+        if (b.dy < 0) continue;
+        const y = surfaceY + b.dy;
+        if (y >= CONFIG.minY && y <= CONFIG.maxY) operations.push({ x, y, z, p: b.p });
+      }
+
+      // Carve the underside out of the source's real deep layers. We don't create a
+      // synthetic palette: each block here is copied from the actual captured chunk.
+      const depth = Math.max(2, Math.floor(CONFIG.maxDepth * Math.pow(mask, 0.72)));
+      let placed = 0;
+      for (let i = col.blocks.length - 1; i >= 0 && placed < depth; i--) {
+        const b = col.blocks[i];
+        if (!b.deep || b.y >= col.surfaceY) continue;
+        const local = rand(hash(x, z, seed) ^ placed);
+        if (placed > depth * 0.72 && local() < 0.08) { placed++; continue; }
+        const y = surfaceY - placed - 1;
+        if (y < CONFIG.minY) break;
+        operations.push({ x, y, z, p: b.p });
+        placed++;
+      }
+    }
+    if (x % 8 === 0) await system.waitTicks(1);
+  }
+
+  for (let i = 0; i < operations.length; i += CONFIG.batchSize) {
+    const end = Math.min(operations.length, i + CONFIG.batchSize);
+    for (let j = i; j < end; j++) {
+      const o = operations[j];
+      setPermutation(dimension, CONFIG.centerX + o.x, o.y, CONFIG.centerZ + o.z, o.p);
+    }
+    await system.waitTicks(1);
+  }
+}
+
+async function generate() {
+  const dimension = world.getDimension(CONFIG.dimension);
+  let seed = world.getDynamicProperty(CONFIG.seedProperty);
+  if (seed === undefined) {
+    seed = hash(Math.floor(world.getAbsoluteTime()), world.getDay(), 0x1a51a7);
+    world.setDynamicProperty(CONFIG.seedProperty, seed);
+  }
+
+  console.warn("[IslandAddon] Capturing source terrain...");
+  const source = await captureSource(dimension);
+  console.warn("[IslandAddon] Carving outside the natural island boundary...");
+  await clearOutside(dimension, source, Number(seed));
+  console.warn("[IslandAddon] Building the carved island from captured terrain...");
+  await buildIsland(dimension, source, Number(seed));
+  world.setDynamicProperty(CONFIG.completeProperty, true);
+  console.warn("[IslandAddon] Complete.");
+}
+
+world.afterEvents.playerSpawn.subscribe(event => {
+  if (!event.initialSpawn || running) return;
+  if (world.getDynamicProperty(CONFIG.completeProperty)) return;
+  running = true;
+  system.runTimeout(() => generate().catch(e => console.warn(`[IslandAddon] Failed: ${e}`)), 40);
 });
