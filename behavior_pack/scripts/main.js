@@ -1,255 +1,175 @@
 import { world, system } from "@minecraft/server";
-import { CONFIG, hash, noise, islandMask, captureColumn, sourceAt } from "./terrain.js";
+import { hash, noise, sourceAt } from "./terrain.js";
 
-const SKY = {
-  dimension: "overworld",
-  worldRadius: 768,
-  islandSpacing: 192,
-  islandRadius: 72,
-  sourceRadius: 96,
-  surfaceY: 110,
-  minY: 0,
+const CONFIG = {
+  surfaceY: 120,
+  sourceRadius: 40,
+  islandRadius: 30,
+  maxDepth: 42,
+  minY: -64,
   maxY: 319,
-  maxDepth: 92,
-  sourceY: 64,
-  batch: 256,
-  maxIslands: 48,
+  batch: 128,
+  runProperty: "islandaddon_test_complete",
   seedProperty: "islandaddon_seed",
-  completeProperty: "islandaddon_skyworld_complete",
-  progressProperty: "islandaddon_skyworld_progress",
 };
 
-let running = false;
+let started = false;
+let busy = false;
 const AIR = new Set(["minecraft:air", "minecraft:cave_air", "minecraft:void_air"]);
 const WATER = new Set(["minecraft:water", "minecraft:flowing_water"]);
-const STRUCTURE = /(^|:)(oak|spruce|birch|jungle|acacia|dark_oak|mangrove|cherry|bamboo|crimson|warped)_(log|wood|planks|stem|hyphae|stripped_log|stripped_wood|stripped_stem|stripped_hyphae)$/;
-const DEEP = new Set(["minecraft:stone", "minecraft:deepslate", "minecraft:tuff", "minecraft:granite", "minecraft:diorite", "minecraft:andesite", "minecraft:calcite", "minecraft:dripstone_block"]);
 
 function isAir(id) { return AIR.has(id); }
 function isWater(id) { return WATER.has(id); }
-function isStructure(id) { return STRUCTURE.test(id); }
-function isDeep(id) { return DEEP.has(id); }
-function setAir(d, x, y, z) { try { d.setBlockType({ x, y, z }, "minecraft:air"); } catch {} }
-function setBlock(d, x, y, z, p) { try { d.setBlockPermutation({ x, y, z }, p); } catch {} }
-
+function isNaturalSurface(id) {
+  return id.includes("grass") || id.includes("dirt") || id.includes("stone") || id.includes("sand") ||
+    id.includes("gravel") || id.includes("clay") || id.includes("mud") || id.includes("snow") ||
+    id.includes("podzol") || id.includes("mycelium") || id.includes("path") || id.includes("farmland") ||
+    id.includes("netherrack") || id.includes("nylium") || id.includes("soul_sand") || id.includes("soul_soil") ||
+    id.includes("deepslate");
+}
+function isDeepMaterial(id) {
+  return id === "minecraft:stone" || id === "minecraft:deepslate" || id === "minecraft:tuff" ||
+    id === "minecraft:granite" || id === "minecraft:diorite" || id === "minecraft:andesite" ||
+    id === "minecraft:calcite" || id === "minecraft:dripstone_block";
+}
 function rng(seed) {
   let x = seed >>> 0;
-  return () => {
-    x ^= x << 13; x >>>= 0; x ^= x >>> 17; x >>>= 0; x ^= x << 5; x >>>= 0;
-    return (x >>> 0) / 4294967296;
-  };
+  return () => { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x >>>= 0; x ^= x << 5; x >>>= 0; return (x >>> 0) / 4294967296; };
 }
+function setBlock(d, x, y, z, p) { const b = d.getBlock({ x, y, z }); if (b) b.setPermutation(p); }
+function clearBlock(d, x, y, z) { const b = d.getBlock({ x, y, z }); if (b && !isAir(b.typeId)) b.setType("minecraft:air"); }
 
-function islandSeed(seed, gx, gz) { return hash(gx, gz, seed ^ 0x9e3779b9); }
-
-function islandCenters(seed) {
-  const result = [];
-  const grid = Math.ceil(SKY.worldRadius / SKY.islandSpacing);
-  const random = rng(seed);
-  for (let gx = -grid; gx <= grid; gx++) {
-    for (let gz = -grid; gz <= grid; gz++) {
-      if (gx === 0 && gz === 0) {
-        result.push({ gx, gz, x: 0, z: 0, seed: islandSeed(seed, gx, gz), radius: SKY.islandRadius });
-        continue;
-      }
-      if (result.length >= SKY.maxIslands) continue;
-      const s = islandSeed(seed, gx, gz);
-      const r = rng(s);
-      // Sparse archipelago: deterministic holes in the grid.
-      if (r() > 0.62) continue;
-      const jitterX = Math.floor((r() - 0.5) * 70);
-      const jitterZ = Math.floor((r() - 0.5) * 70);
-      const radius = 52 + Math.floor(r() * 30);
-      result.push({
-        gx, gz,
-        x: gx * SKY.islandSpacing + jitterX,
-        z: gz * SKY.islandSpacing + jitterZ,
-        seed: s,
-        radius,
-      });
-    }
-  }
-  return result.sort((a, b) => (a.x * a.x + a.z * a.z) - (b.x * b.x + b.z * b.z));
-}
-
-function islandMask3D(dx, dy, dz, radius, seed) {
-  const nx = dx / radius;
-  const nz = dz / radius;
-  if (Math.abs(nx) > 1.12 || Math.abs(nz) > 1.12) return false;
-
-  // Top is intentionally broad and almost flat. The underside narrows downward,
-  // but erosion makes the silhouette organic instead of a perfect cone/teardrop.
-  const edgeNoise = noise(dx * 0.035, dz * 0.035, seed) * 0.16 + noise(dx * 0.10, dz * 0.10, seed ^ 77) * 0.06;
-  const horizontal = Math.sqrt(nx * nx + nz * nz);
-  const coastline = 1.0 + edgeNoise;
-  if (horizontal > coastline) return false;
-
-  const normalizedDepth = Math.max(0, -dy / SKY.maxDepth);
-  if (dy > 0) return true;
-  const taper = Math.max(0.055, 1 - Math.pow(normalizedDepth, 0.72) * 0.92);
-  const bottomX = dx / (radius * taper);
-  const bottomZ = dz / (radius * taper);
-  if (Math.sqrt(bottomX * bottomX + bottomZ * bottomZ) > 1 + edgeNoise * 0.35) return false;
-
-  // Virtual explosion-like erosion. These are mathematical voids, not actual
-  // explosions, avoiding fire, drops, entity damage, and massive event overhead.
-  for (let i = 0; i < 5; i++) {
-    const s = hash(i, Math.floor(normalizedDepth * 20), seed);
-    const rr = rng(s);
-    const ex = (rr() * 2 - 1) * radius * 0.75;
-    const ez = (rr() * 2 - 1) * radius * 0.75;
-    const ey = -rr() * SKY.maxDepth * 0.9;
-    const er = 5 + rr() * 14;
-    const ddx = dx - ex, ddy = dy - ey, ddz = dz - ez;
-    if (ddx * ddx + ddy * ddy + ddz * ddz < er * er && dy < -5) return false;
-  }
-  return true;
-}
-
-function findSurface(dimension, x, z) {
-  const top = dimension.getTopmostBlock({ x, z }, SKY.minY);
+function findTerrainSurface(d, x, z) {
+  let top;
+  try { top = d.getTopmostBlock({ x, z }, CONFIG.minY); } catch { return null; }
   if (!top) return null;
-  let y = top.location.y;
-  // Structures are deliberately ignored while searching for the terrain surface.
-  while (y > SKY.minY) {
-    const b = dimension.getBlock({ x, y, z });
-    if (!b || isAir(b.typeId)) { y--; continue; }
-    if (isWater(b.typeId)) { y--; continue; }
-    if (!isStructure(b.typeId)) return { y, topY: top.location.y };
-    y--;
+  for (let y = Math.min(top.location.y, CONFIG.maxY); y >= CONFIG.minY; y--) {
+    const b = d.getBlock({ x, y, z });
+    if (!b || isAir(b.typeId) || isWater(b.typeId)) continue;
+    if (isNaturalSurface(b.typeId)) return y;
   }
   return null;
 }
 
-function captureColumn(dimension, x, z) {
-  const info = findSurface(dimension, x, z);
-  if (!info) return null;
-  const blocks = [];
-  for (let y = SKY.minY; y <= info.topY; y++) {
-    const b = dimension.getBlock({ x, y, z });
-    if (!b || isAir(b.typeId)) continue;
-    blocks.push({ y, dy: y - info.y, p: b.permutation, id: b.typeId, deep: isDeep(b.typeId), water: isWater(b.typeId) });
-  }
-  return { surfaceY: info.y, topY: info.topY, blocks };
-}
-
-async function captureSource(dimension, centerX, centerZ) {
+async function captureSource(d, cx, cz) {
   const source = new Map();
-  let n = 0;
-  for (let x = -SKY.sourceRadius; x <= SKY.sourceRadius; x++) {
-    for (let z = -SKY.sourceRadius; z <= SKY.sourceRadius; z++) {
-      const c = captureColumn(dimension, centerX + x, centerZ + z);
-      if (c) source.set(`${x},${z}`, c);
-      if (++n % 192 === 0) await system.waitTicks(1);
+  let scanned = 0;
+  for (let x = -CONFIG.sourceRadius; x <= CONFIG.sourceRadius; x++) {
+    for (let z = -CONFIG.sourceRadius; z <= CONFIG.sourceRadius; z++) {
+      const sx = cx + x, sz = cz + z, surfaceY = findTerrainSurface(d, sx, sz);
+      if (surfaceY === null) continue;
+      const blocks = [], deep = [];
+      for (let y = surfaceY; y <= Math.min(CONFIG.maxY, surfaceY + 48); y++) {
+        const b = d.getBlock({ x: sx, y, z: sz });
+        if (b && !isAir(b.typeId)) blocks.push({ dy: y - surfaceY, permutation: b.permutation });
+      }
+      for (let y = surfaceY - 1; y >= Math.max(CONFIG.minY, surfaceY - 48); y--) {
+        const b = d.getBlock({ x: sx, y, z: sz });
+        if (b && !isAir(b.typeId) && !isWater(b.typeId) && isDeepMaterial(b.typeId)) deep.push(b.permutation);
+      }
+      source.set(`${x},${z}`, { surfaceY, blocks, deep });
+      if (++scanned % 64 === 0) await system.waitTicks(1);
     }
   }
   return source;
 }
 
-async function clearDestination(dimension, centerX, centerZ, radius) {
-  let n = 0;
-  const r = radius + 6;
+function islandInside(dx, depth, dz, radius, seed) {
+  const distance = Math.sqrt(dx * dx + dz * dz);
+  const edge = noise(dx * 0.08, dz * 0.08, seed) * 3.5 + noise(dx * 0.025, dz * 0.025, seed ^ 0x71) * 5;
+  if (distance > radius + edge) return false;
+  if (depth <= 0) return true;
+  const t = Math.min(1, depth / CONFIG.maxDepth);
+  const taper = Math.max(0.06, 1 - Math.pow(t, 0.68) * 0.94);
+  const lowerRadius = radius * taper;
+  if (distance > lowerRadius + noise(dx * 0.12, dz * 0.12, seed ^ 0x31) * 2) return false;
+  for (let i = 0; i < 3; i++) {
+    const r = rng(hash(seed, depth * 17 + i, i * 101));
+    const ex = (r() * 2 - 1) * radius * 0.7, ez = (r() * 2 - 1) * radius * 0.7;
+    const ey = r() * CONFIG.maxDepth, er = 3 + r() * 7;
+    const ddx = dx - ex, ddy = depth - ey, ddz = dz - ez;
+    if (ddx * ddx + ddy * ddy + ddz * ddz < er * er && depth > 5) return false;
+  }
+  return true;
+}
+
+async function clearTestArea(d, cx, cz) {
+  const r = CONFIG.islandRadius + 3;
+  let count = 0;
+  for (let x = -r; x <= r; x++) for (let z = -r; z <= r; z++) {
+    for (let y = CONFIG.surfaceY - CONFIG.maxDepth - 2; y <= CONFIG.maxY; y++) {
+      clearBlock(d, cx + x, y, cz + z);
+      if (++count >= CONFIG.batch) { count = 0; await system.waitTicks(1); }
+    }
+  }
+}
+
+async function buildTestIsland(d, source, cx, cz, seed) {
+  const writes = [], r = CONFIG.islandRadius;
   for (let x = -r; x <= r; x++) {
     for (let z = -r; z <= r; z++) {
-      for (let y = SKY.minY; y <= SKY.maxY; y++) {
-        setAir(dimension, centerX + x, y, centerZ + z);
-        if (++n >= SKY.batch) { n = 0; await system.waitTicks(1); }
-      }
-    }
-  }
-}
-
-async function carveIsland(dimension, island, source) {
-  const writes = [];
-  const clears = [];
-  const radius = island.radius;
-
-  // Surface and structures: source columns are translated so their natural surface
-  // sits around the sky-world elevation. This carries trees, villages, paths, houses,
-  // and any blocks above the terrain with them.
-  for (let x = -radius; x <= radius; x++) {
-    for (let z = -radius; z <= radius; z++) {
       const c = sourceAt(source, x, z);
       if (!c) continue;
-      const dx = x, dz = z;
-      if (Math.sqrt(dx * dx + dz * dz) > radius * 1.12) continue;
-      const targetSurface = SKY.surfaceY + Math.round((c.surfaceY - SKY.sourceY) * 0.12);
-      for (const b of c.blocks) {
-        if (b.dy < 0) continue;
-        const y = targetSurface + b.dy;
-        if (y >= SKY.minY && y <= SKY.maxY) writes.push({ x: island.x + x, y, z: island.z + z, p: b.p });
+      for (const block of c.blocks) {
+        const y = CONFIG.surfaceY + block.dy;
+        if (y >= CONFIG.minY && y <= CONFIG.maxY) writes.push({ x: cx + x, y, z: cz + z, permutation: block.permutation });
       }
     }
-    if (x % 8 === 0) await system.waitTicks(1);
+    if (x % 6 === 0) await system.waitTicks(1);
   }
-
-  // Carve a 3D inverted-teardrop mass out of actual deep source material. The
-  // underside is deliberately irregular and contains virtual explosion voids.
-  for (let x = -radius; x <= radius; x++) {
-    for (let z = -radius; z <= radius; z++) {
+  for (let x = -r; x <= r; x++) {
+    for (let z = -r; z <= r; z++) {
       const c = sourceAt(source, x, z);
-      if (!c) continue;
-      const targetSurface = SKY.surfaceY + Math.round((c.surfaceY - SKY.sourceY) * 0.12);
-      for (let depth = 1; depth <= SKY.maxDepth; depth++) {
-        const y = targetSurface - depth;
-        if (y < SKY.minY) break;
-        if (!islandMask3D(x, -depth, z, radius, island.seed)) {
-          clears.push({ x: island.x + x, y, z: island.z + z });
-          continue;
-        }
-        // Select real deep source blocks from progressively deeper source material.
-        let chosen = null;
-        for (let i = c.blocks.length - 1; i >= 0; i--) {
-          if (c.blocks[i].deep && c.blocks[i].y < c.surfaceY) { chosen = c.blocks[i]; break; }
-        }
-        if (chosen) writes.push({ x: island.x + x, y, z: island.z + z, p: chosen.p });
+      if (!c || c.deep.length === 0) continue;
+      const random = rng(hash(seed, x, z));
+      for (let depth = 1; depth <= CONFIG.maxDepth; depth++) {
+        if (!islandInside(x, depth, z, r, seed)) continue;
+        writes.push({ x: cx + x, y: CONFIG.surfaceY - depth, z: cz + z, permutation: c.deep[Math.floor(random() * c.deep.length)] });
       }
     }
-    if (x % 8 === 0) await system.waitTicks(1);
+    if (x % 6 === 0) await system.waitTicks(1);
   }
-
-  for (let i = 0; i < clears.length; i += SKY.batch) {
-    for (let j = i; j < Math.min(clears.length, i + SKY.batch); j++) {
-      const c = clears[j]; setAir(dimension, c.x, c.y, c.z);
-    }
-    await system.waitTicks(1);
-  }
-  for (let i = 0; i < writes.length; i += SKY.batch) {
-    for (let j = i; j < Math.min(writes.length, i + SKY.batch); j++) {
-      const w = writes[j]; setBlock(dimension, w.x, w.y, w.z, w.p);
+  for (let i = 0; i < writes.length; i += CONFIG.batch) {
+    for (let j = i; j < Math.min(writes.length, i + CONFIG.batch); j++) {
+      const w = writes[j]; setBlock(d, w.x, w.y, w.z, w.permutation);
     }
     await system.waitTicks(1);
   }
 }
 
-async function generateSkyWorld() {
-  const dimension = world.getDimension(SKY.dimension);
-  let seed = world.getDynamicProperty(SKY.seedProperty);
-  if (seed === undefined) {
-    seed = hash(Math.floor(world.getAbsoluteTime()), world.getDay(), 0x534b5957);
-    world.setDynamicProperty(SKY.seedProperty, seed);
-  }
+async function runTestIsland(player) {
+  if (busy) return;
+  busy = true;
+  const d = player.dimension, cx = Math.floor(player.location.x), cz = Math.floor(player.location.z);
+  let seed = world.getDynamicProperty(CONFIG.seedProperty);
+  if (seed === undefined) { seed = hash(cx, cz, Math.floor(world.getAbsoluteTime())); world.setDynamicProperty(CONFIG.seedProperty, seed); }
   seed = Number(seed);
-  const islands = islandCenters(seed);
-  console.warn(`[IslandAddon] Generating sky world: ${islands.length} islands, seed ${seed}`);
-
-  for (let i = 0; i < islands.length; i++) {
-    const island = islands[i];
-    world.setDynamicProperty(SKY.progressProperty, i);
-    console.warn(`[IslandAddon] Island ${i + 1}/${islands.length} at ${island.x}, ${island.z}`);
-    const source = await captureSource(dimension, island.x, island.z);
-    await clearDestination(dimension, island.x, island.z, island.radius);
-    await carveIsland(dimension, island, source);
-  }
-
-  world.setDynamicProperty(SKY.progressProperty, islands.length);
-  world.setDynamicProperty(SKY.completeProperty, true);
-  console.warn("[IslandAddon] Sky world generation complete.");
+  try {
+    player.sendMessage("§a[IslandAddon] Loaded successfully.");
+    player.sendMessage("§b[IslandAddon] Starting one-island test...");
+    player.sendMessage(`§7[IslandAddon] Seed: ${seed}`);
+    player.sendMessage(`§7[IslandAddon] Capturing terrain around ${cx}, ${cz}...`);
+    const source = await captureSource(d, cx, cz);
+    player.sendMessage(`§7[IslandAddon] Captured ${source.size} terrain columns.`);
+    player.sendMessage("§7[IslandAddon] Clearing test area...");
+    await clearTestArea(d, cx, cz);
+    player.sendMessage("§7[IslandAddon] Carving natural inverted-teardrop island...");
+    await buildTestIsland(d, source, cx, cz, seed);
+    player.teleport({ x: cx + 0.5, y: CONFIG.surfaceY + 3, z: cz + 0.5 }, { dimension: d });
+    player.sendMessage("§a[IslandAddon] One-island test complete!");
+    world.setDynamicProperty(CONFIG.runProperty, true);
+  } catch (error) {
+    player.sendMessage(`§c[IslandAddon] ERROR: ${error}`);
+    console.warn(`[IslandAddon] Test island failed: ${error?.stack ?? error}`);
+  } finally { busy = false; }
 }
 
 world.afterEvents.playerSpawn.subscribe(event => {
-  if (!event.initialSpawn || running) return;
-  if (world.getDynamicProperty(SKY.completeProperty)) return;
-  running = true;
-  system.runTimeout(() => generateSkyWorld().catch(e => console.warn(`[IslandAddon] Sky world failed: ${e}`)), 40);
+  if (!event.initialSpawn || started) return;
+  started = true;
+  system.runTimeout(() => {
+    const player = event.player;
+    player.sendMessage("§b[IslandAddon] Addon script started.");
+    system.runTimeout(() => runTestIsland(player), 40);
+  }, 20);
 });
