@@ -1,0 +1,25 @@
+{
+  "format_version": 2,
+  "header": {
+    "name": "IslandAddon v{{BUILD_VERSION}}",
+    "description": "Turns the spawn area into a seeded upside-down teardrop island using blocks sampled from the generated world.",
+    "uuid": "{{PACK_UUID}}",
+    "version": [1, 0, 0]
+  },
+  "modules": [
+    {
+      "description": "IslandAddon Script",
+      "type": "script",
+      "language": "javascript",
+      "uuid": "{{SCRIPT_UUID}}",
+      "entry": "scripts/main.js",
+      "version": [1, 0, 0]
+    }
+  ],
+  "dependencies": [
+    {
+      "module_name": "@minecraft/server",
+      "version": "2.0.0"
+    }
+  ]
+}
