@@ -25,6 +25,7 @@ const manifest = {
   header: {
     name: `IslandAddon ${version}`,
     description: "Procedurally carves existing Minecraft terrain into a seeded natural sky-world archipelago.",
+    min_engine_version: [1, 21, 0],
     uuid: packUuid,
     version: [1, 0, Number(build) || 0]
   },
@@ -59,7 +60,6 @@ await new Promise((resolve, reject) => {
   archive.finalize().catch(reject);
 });
 
-// Fail the CI build if the artifact was not actually written as a ZIP archive.
 const signature = fs.readFileSync(zip).subarray(0, 4);
 if (signature[0] !== 0x50 || signature[1] !== 0x4b || signature[2] !== 0x03 || signature[3] !== 0x04) {
   throw new Error(`Generated artifact is not a ZIP archive: ${zip}`);
