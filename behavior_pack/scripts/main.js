@@ -39,12 +39,51 @@ function rng(seed) {
 function setBlock(d, x, y, z, p) { const b = d.getBlock({ x, y, z }); if (b) b.setPermutation(p); }
 function clearBlock(d, x, y, z) { const b = d.getBlock({ x, y, z }); if (b && !isAir(b.typeId)) b.setType("minecraft:air"); }
 
+// Bedrock's block API can return null when a chunk is not loaded. We deliberately
+// use the player's current position as the load anchor and test a small area first.
+function playerChunkLoaded(d, cx, cz) {
+  const probes = [
+    [cx, cz],
+    [cx + 8, cz], [cx - 8, cz], [cx, cz + 8], [cx, cz - 8],
+    [cx + 15, cz + 15], [cx - 15, cz + 15], [cx + 15, cz - 15], [cx - 15, cz - 15],
+  ];
+  let loaded = 0;
+  for (const [x, z] of probes) {
+    try {
+      const b = d.getBlock({ x, y: Math.floor(CONFIG.surfaceY), z });
+      if (b) loaded++;
+    } catch {}
+  }
+  return { loaded, total: probes.length };
+}
+
+async function waitForPlayerArea(player) {
+  const d = player.dimension;
+  const cx = Math.floor(player.location.x);
+  const cz = Math.floor(player.location.z);
+  for (let attempt = 1; attempt <= 10; attempt++) {
+    const probe = playerChunkLoaded(d, cx, cz);
+    player.sendMessage(`§7[IslandAddon] Loaded chunk probes: ${probe.loaded}/${probe.total} (attempt ${attempt}/10)`);
+    if (probe.loaded >= 1) return true;
+    await system.waitTicks(20);
+  }
+  return false;
+}
+
 function findTerrainSurface(d, x, z) {
-  let top;
-  try { top = d.getTopmostBlock({ x, z }, CONFIG.minY); } catch { return null; }
-  if (!top) return null;
-  for (let y = Math.min(top.location.y, CONFIG.maxY); y >= CONFIG.minY; y--) {
-    const b = d.getBlock({ x, y, z });
+  // The player is the load anchor. getBlock() returns null for unloaded chunks;
+  // start near the actual player height and walk downward instead of relying on
+  // getTopmostBlock, which can fail to provide useful data outside loaded terrain.
+  let topY = CONFIG.surfaceY + 64;
+  try {
+    const playerBlock = d.getBlock({ x, y: Math.floor(CONFIG.surfaceY), z });
+    if (!playerBlock) return null;
+    topY = Math.min(CONFIG.maxY, Math.max(CONFIG.minY, Math.floor(CONFIG.surfaceY) + 64));
+  } catch { return null; }
+
+  for (let y = topY; y >= CONFIG.minY; y--) {
+    let b;
+    try { b = d.getBlock({ x, y, z }); } catch { return null; }
     if (!b || isAir(b.typeId) || isWater(b.typeId)) continue;
     if (isNaturalSurface(b.typeId)) return y;
   }
@@ -54,8 +93,11 @@ function findTerrainSurface(d, x, z) {
 async function captureSource(d, cx, cz) {
   const source = new Map();
   let scanned = 0;
-  for (let x = -CONFIG.sourceRadius; x <= CONFIG.sourceRadius; x++) {
-    for (let z = -CONFIG.sourceRadius; z <= CONFIG.sourceRadius; z++) {
+  // Capture only the test island footprint. This makes the first test small enough
+  // to run while the player keeps the source chunks loaded.
+  const r = CONFIG.islandRadius;
+  for (let x = -r; x <= r; x++) {
+    for (let z = -r; z <= r; z++) {
       const sx = cx + x, sz = cz + z, surfaceY = findTerrainSurface(d, sx, sz);
       if (surfaceY === null) continue;
       const blocks = [], deep = [];
@@ -68,7 +110,7 @@ async function captureSource(d, cx, cz) {
         if (b && !isAir(b.typeId) && !isWater(b.typeId) && isDeepMaterial(b.typeId)) deep.push(b.permutation);
       }
       source.set(`${x},${z}`, { surfaceY, blocks, deep });
-      if (++scanned % 64 === 0) await system.waitTicks(1);
+      if (++scanned % 32 === 0) await system.waitTicks(1);
     }
   }
   return source;
@@ -146,11 +188,14 @@ async function runTestIsland(player) {
   seed = Number(seed);
   try {
     player.sendMessage("§a[IslandAddon] Loaded successfully.");
-    player.sendMessage("§b[IslandAddon] Starting one-island test...");
-    player.sendMessage(`§7[IslandAddon] Seed: ${seed}`);
-    player.sendMessage(`§7[IslandAddon] Capturing terrain around ${cx}, ${cz}...`);
+    player.sendMessage("§b[IslandAddon] Starting one-island test at your current position.");
+    player.sendMessage(`§7[IslandAddon] Player position: ${cx}, ${Math.floor(player.location.y)}, ${cz}`);
+    const loaded = await waitForPlayerArea(player);
+    if (!loaded) throw new Error("The player's current chunk could not be read. Move around briefly and rejoin so Bedrock loads the area.");
+    player.sendMessage(`§7[IslandAddon] Capturing terrain around your position...`);
     const source = await captureSource(d, cx, cz);
     player.sendMessage(`§7[IslandAddon] Captured ${source.size} terrain columns.`);
+    if (source.size === 0) throw new Error("Player chunk was loaded, but no terrain columns could be read. The source scan is being expanded from the player's loaded area in the next pass.");
     player.sendMessage("§7[IslandAddon] Clearing test area...");
     await clearTestArea(d, cx, cz);
     player.sendMessage("§7[IslandAddon] Carving natural inverted-teardrop island...");
