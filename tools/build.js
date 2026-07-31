@@ -28,7 +28,10 @@ const manifest = {
     description: "Procedurally carves existing Minecraft terrain into a seeded natural sky-world archipelago.",
     min_engine_version: [1, 21, 0],
     uuid: packUuid,
-    version: [1, 0, Number(build) || 0]
+    version: [1, 0, Number(build) || 0],
+    // Bedrock looks for this image at the root of the behavior pack.
+    // The build copies it into the pack and the manifest references it here.
+    icon: "pack_icon.png"
   },
   modules: [{
     description: "IslandAddon Script",
@@ -47,10 +50,17 @@ for (const file of ["main.js", "terrain.js"]) {
   if (!fs.existsSync(source)) throw new Error(`Missing required script: ${source}`);
   fs.copyFileSync(source, path.join(pack, "scripts", file));
 }
+
+const iconSource = path.join(root, "behavior_pack", "pack_icon.png");
+const iconTarget = path.join(pack, "pack_icon.png");
+if (!fs.existsSync(iconSource)) {
+  throw new Error(`Missing required pack icon: ${iconSource}`);
+}
+fs.copyFileSync(iconSource, iconTarget);
+
 fs.writeFileSync(path.join(pack, "README.txt"), `IslandAddon ${version}\nBuild: ${build}\nPack UUID: ${packUuid}\nScript UUID: ${scriptUuid}\n`);
 
-// A .mcpack is itself a ZIP. Its ROOT must contain manifest.json and scripts/.
-// Do not put the pack inside an additional top-level folder.
+// A .mcpack is itself a ZIP. Its ROOT must contain manifest.json, scripts/, and pack_icon.png.
 await new Promise((resolve, reject) => {
   const output = fs.createWriteStream(zip);
   const archive = archiver("zip", { zlib: { level: 9 } });
