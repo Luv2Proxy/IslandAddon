@@ -12,13 +12,14 @@ const build = process.env.GITHUB_RUN_NUMBER || process.env.BUILD_NUMBER || (() =
 })();
 const version = `1.0.0-v${build}`;
 const dist = path.join(root, "dist");
-const out = path.join(dist, `IslandAddon-${version}`);
-const zip = path.join(dist, `IslandAddon-${version}.mcaddon`);
+const staging = path.join(dist, `IslandAddon-${version}`);
+const pack = path.join(staging, "IslandAddon_BP");
+const zip = path.join(dist, `IslandAddon-${version}.mcpack`);
 const packUuid = crypto.randomUUID();
 const scriptUuid = crypto.randomUUID();
 
 fs.rmSync(dist, { recursive: true, force: true });
-fs.mkdirSync(path.join(out, "behavior_pack", "scripts"), { recursive: true });
+fs.mkdirSync(path.join(pack, "scripts"), { recursive: true });
 
 const manifest = {
   format_version: 2,
@@ -40,28 +41,31 @@ const manifest = {
   dependencies: [{ module_name: "@minecraft/server", version: "2.0.0" }]
 };
 
-fs.writeFileSync(path.join(out, "behavior_pack", "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
+fs.writeFileSync(path.join(pack, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
 for (const file of ["main.js", "terrain.js"]) {
   const source = path.join(root, "behavior_pack", "scripts", file);
   if (!fs.existsSync(source)) throw new Error(`Missing required script: ${source}`);
-  fs.copyFileSync(source, path.join(out, "behavior_pack", "scripts", file));
+  fs.copyFileSync(source, path.join(pack, "scripts", file));
 }
-fs.writeFileSync(path.join(out, "README.txt"), `IslandAddon ${version}\n\nBuild: ${build}\nPack UUID: ${packUuid}\nScript UUID: ${scriptUuid}\n\nProcedural sky-world archipelago generator.\n`);
+fs.writeFileSync(path.join(pack, "README.txt"), `IslandAddon ${version}\nBuild: ${build}\nPack UUID: ${packUuid}\nScript UUID: ${scriptUuid}\n`);
 
+// A .mcpack is itself a ZIP. Its ROOT must contain manifest.json and scripts/.
+// Do not put the pack inside an additional top-level folder.
 await new Promise((resolve, reject) => {
   const output = fs.createWriteStream(zip);
   const archive = archiver("zip", { zlib: { level: 9 } });
-  output.on("close", resolve);
-  output.on("error", reject);
-  archive.on("error", reject);
+  let settled = false;
+  const fail = error => { if (!settled) { settled = true; reject(error); } };
+  output.on("close", () => { if (!settled) { settled = true; resolve(); } });
+  output.on("error", fail);
+  archive.on("error", fail);
   archive.pipe(output);
-  archive.directory(path.join(out, "behavior_pack"), "behavior_pack");
-  archive.file(path.join(out, "README.txt"), { name: "README.txt" });
-  archive.finalize().catch(reject);
+  archive.directory(pack, false);
+  archive.finalize().catch(fail);
 });
 
 const signature = fs.readFileSync(zip).subarray(0, 4);
 if (signature[0] !== 0x50 || signature[1] !== 0x4b || signature[2] !== 0x03 || signature[3] !== 0x04) {
   throw new Error(`Generated artifact is not a ZIP archive: ${zip}`);
 }
-console.log(`Built valid Minecraft addon: ${zip} (${fs.statSync(zip).size} bytes)`);
+console.log(`Built valid Minecraft behavior pack: ${zip} (${fs.statSync(zip).size} bytes)`);
