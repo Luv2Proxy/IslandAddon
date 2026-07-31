@@ -30,11 +30,18 @@ jobs:
         env:
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
 
-      - name: Upload .mcaddon
+      - name: Verify generated addon
+        run: |
+          test -f dist/*.mcpack
+          unzip -l dist/*.mcpack
+          unzip -p dist/*.mcpack manifest.json | grep -q '"min_engine_version"'
+          unzip -p dist/*.mcpack manifest.json | grep -q '"modules"'
+
+      - name: Upload .mcpack
         uses: actions/upload-artifact@v4
         with:
           name: IslandAddon-v${{ github.run_number }}
-          path: dist/*.mcaddon
+          path: dist/*.mcpack
           if-no-files-found: error
 
       - name: Create GitHub Release
@@ -44,4 +51,4 @@ jobs:
           tag_name: v${{ github.run_number }}
           name: IslandAddon v${{ github.run_number }}
           generate_release_notes: true
-          files: dist/*.mcaddon
+          files: dist/*.mcpack
