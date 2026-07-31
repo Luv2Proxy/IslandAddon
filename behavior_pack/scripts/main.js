@@ -140,22 +140,31 @@ async function clearTestArea(player, cx, cz) {
   await d.runCommand(`fill ${minX} ${minY} ${minZ} ${maxX} ${maxY} ${maxZ} air`);
 }
 
-async function cloneBottomSection(player, cx, cz, source) {
+async function cloneBottomSection(player, cx, cz) {
   const d = player.dimension, r = CONFIG.islandRadius;
   const sx1 = cx - r, sz1 = cz - r, sx2 = cx + r, sz2 = cz + r;
   const stagingX1 = sx1 + CONFIG.stagingOffsetX, stagingX2 = sx2 + CONFIG.stagingOffsetX;
   const minY = CONFIG.surfaceY - CONFIG.maxDepth, maxY = CONFIG.surfaceY - CONFIG.surfaceLayers;
-  player.sendMessage("§7[IslandAddon] Staging bottom terrain for /clone...");
-  await d.runCommand(`clone ${sx1} ${minY} ${sz1} ${sx2} ${maxY} ${sz2} ${stagingX1} ${minY} ${sz1} replace`);
-  player.sendMessage("§7[IslandAddon] Cloning bottom terrain back into the island...");
+  player.sendMessage("§7[IslandAddon] Cloning staged bottom terrain back into the island...");
   await d.runCommand(`clone ${stagingX1} ${minY} ${sz1} ${stagingX2} ${maxY} ${sz2} ${sx1} ${minY} ${sz1} replace`);
-  await d.runCommand(`fill ${stagingX1} ${minY} ${sz1} ${stagingX2} ${maxY} ${sz2} air`);
+}
+
+async function clearStagingArea(player, cx, cz) {
+  const d = player.dimension, r = CONFIG.islandRadius;
+  const minX = cx - r + CONFIG.stagingOffsetX;
+  const maxX = cx + r + CONFIG.stagingOffsetX;
+  const minZ = cz - r;
+  const maxZ = cz + r;
+  const minY = CONFIG.surfaceY - CONFIG.maxDepth;
+  const maxY = CONFIG.surfaceY - CONFIG.surfaceLayers;
+  player.sendMessage("§7[IslandAddon] Deleting old staged source area...");
+  await d.runCommand(`fill ${minX} ${minY} ${minZ} ${maxX} ${maxY} ${maxZ} air`);
+  player.sendMessage("§7[IslandAddon] Old source area deleted.");
 }
 
 async function buildTestIsland(player, source, cx, cz, seed) {
   const d = player.dimension, r = CONFIG.islandRadius;
-  // Native clone establishes the lower bulk quickly. The source was staged before deletion.
-  await cloneBottomSection(player, cx, cz, source);
+  await cloneBottomSection(player, cx, cz);
   const surfaceWrites = [], gravityWrites = [], structureWrites = [];
   for (let x = -r; x <= r; x++) {
     for (let z = -r; z <= r; z++) {
@@ -187,7 +196,6 @@ async function buildTestIsland(player, source, cx, cz, seed) {
     }
     if (x % 6 === 0) await system.waitTicks(1);
   }
-  // Put gravity blocks in after their supporting terrain, bottom-to-top.
   gravityWrites.push(...surfaceWrites.filter(w => isGravity(w.typeId)).sort((a, b) => a.y - b.y));
   const stableSurface = surfaceWrites.filter(w => !isGravity(w.typeId));
   for (let i = 0; i < stableSurface.length; i += CONFIG.batch) {
@@ -197,7 +205,6 @@ async function buildTestIsland(player, source, cx, cz, seed) {
     await system.waitTicks(1);
   }
   for (const w of gravityWrites) setBlock(d, w.x, w.y, w.z, w.permutation);
-  // Structures are restored after the terrain, retaining their original relative layout.
   for (let i = 0; i < structureWrites.length; i += CONFIG.batch) {
     for (let j = i; j < Math.min(structureWrites.length, i + CONFIG.batch); j++) {
       const w = structureWrites[j]; setBlock(d, w.x, w.y, w.z, w.permutation);
@@ -222,7 +229,6 @@ async function runTestIsland(player) {
     const source = await captureSource(d, cx, cz);
     player.sendMessage(`§7[IslandAddon] Captured ${source.size} terrain columns (ocean columns skipped).`);
     if (source.size === 0) throw new Error("No non-ocean terrain columns could be read.");
-    // Stage the bottom section before the destructive /fill. This makes /clone the source of the bulk island body.
     player.sendMessage("§7[IslandAddon] Staging bottom section for native /clone...");
     const r = CONFIG.islandRadius;
     await d.runCommand(`clone ${cx - r} ${CONFIG.surfaceY - CONFIG.maxDepth} ${cz - r} ${cx + r} ${CONFIG.surfaceY - CONFIG.surfaceLayers} ${cz + r} ${cx - r + CONFIG.stagingOffsetX} ${CONFIG.surfaceY - CONFIG.maxDepth} ${cz - r} replace`);
@@ -230,6 +236,8 @@ async function runTestIsland(player) {
     await clearTestArea(player, cx, cz);
     player.sendMessage("§7[IslandAddon] Carving and rebuilding natural inverted-teardrop island...");
     await buildTestIsland(player, source, cx, cz, seed);
+    // The island is now fully generated. Only now is the temporary old-world staging copy deleted.
+    await clearStagingArea(player, cx, cz);
     player.teleport({ x: cx + 0.5, y: CONFIG.surfaceY + 4, z: cz + 0.5 }, { dimension: d });
     player.sendMessage("§a[IslandAddon] One-island test complete!");
     world.setDynamicProperty(CONFIG.runProperty, true);
