@@ -16,16 +16,30 @@ const scriptUuid = crypto.randomUUID();
 fs.rmSync(path.join(root, "dist"), { recursive: true, force: true });
 fs.mkdirSync(path.join(out, "behavior_pack", "scripts"), { recursive: true });
 
-const manifest = JSON.parse(fs.readFileSync(path.join(root, "behavior_pack", "manifest.json"), "utf8"));
-manifest.header.name = `IslandAddon ${version}`;
-manifest.header.uuid = packUuid;
-manifest.header.version = [1, 0, Number(build) || 0];
-manifest.modules[0].uuid = scriptUuid;
-manifest.modules[0].version = [1, 0, Number(build) || 0];
-fs.writeFileSync(path.join(out, "behavior_pack", "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
-fs.copyFileSync(path.join(root, "behavior_pack", "scripts", "main.js"), path.join(out, "behavior_pack", "scripts", "main.js"));
+const manifest = {
+  format_version: 2,
+  header: {
+    name: `IslandAddon ${version}`,
+    description: "Carves a large piece of existing terrain into a natural inverted-teardrop island.",
+    uuid: packUuid,
+    version: [1, 0, Number(build) || 0]
+  },
+  modules: [{
+    description: "IslandAddon Script",
+    type: "script",
+    language: "javascript",
+    uuid: scriptUuid,
+    entry: "scripts/main.js",
+    version: [1, 0, Number(build) || 0]
+  }],
+  dependencies: [{ module_name: "@minecraft/server", version: "2.0.0" }]
+};
 
-fs.writeFileSync(path.join(out, "README.txt"), `IslandAddon ${version}\n\nGenerated build: ${build}\nPack UUID: ${packUuid}\nScript UUID: ${scriptUuid}\n\nInstall the .mcaddon file into Minecraft Bedrock.\n`);
+fs.writeFileSync(path.join(out, "behavior_pack", "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
+for (const file of ["main.js", "terrain.js"]) {
+  fs.copyFileSync(path.join(root, "behavior_pack", "scripts", file), path.join(out, "behavior_pack", "scripts", file));
+}
+fs.writeFileSync(path.join(out, "README.txt"), `IslandAddon ${version}\n\nBuild: ${build}\nPack UUID: ${packUuid}\nScript UUID: ${scriptUuid}\n\nThe generator captures a large existing terrain region before mutation, then carves and reconstructs a natural inverted-teardrop island from the captured material.\n`);
 
 const archiver = (await import("archiver")).default;
 const output = fs.createWriteStream(zip);
