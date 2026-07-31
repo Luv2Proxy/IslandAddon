@@ -1,0 +1,11 @@
+{
+  "name": "island-addon",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node tools/build.js"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1"
+  }
+}
